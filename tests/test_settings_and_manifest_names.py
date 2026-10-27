@@ -21,7 +21,7 @@ def test_omitted_boolean_cli_options_do_not_override_config_values(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "setting", ["overwrite_manifest", "align_start_times"],
+    "setting", ["overwrite_manifest", "packager_timing_compatibility"],
 )
 @pytest.mark.parametrize("config_value", [True, False])
 @pytest.mark.parametrize("disable", [True, False])
@@ -36,8 +36,8 @@ def test_negative_cli_flags_override_only_when_present(monkeypatch, setting, con
 
 
 @pytest.mark.parametrize("arguments", [
-    ["-no_overwrite_manifest=true"], ["-no_align_start_times=false"],
-    ["-no_overwrite_manifest", "false"], ["-no_align_start_times", "true"],
+    ["-no_overwrite_manifest=true"], ["-no_packager_timing_compatibility=false"],
+    ["-no_overwrite_manifest", "false"], ["-no_packager_timing_compatibility", "true"],
 ])
 def test_negative_cli_flags_reject_boolean_values(arguments):
     with pytest.raises(SystemExit) as error:
@@ -58,9 +58,9 @@ def test_resolve_settings_applies_mode_specific_overwrite_default(settings, expe
     assert resolve_settings(settings)["overwrite_manifest"] is expected_overwrite
 
 
-@pytest.mark.parametrize("settings,expected", [({}, True), ({"align_start_times": False}, False)])
-def test_alignment_defaults_on_and_preserves_explicit_config(settings, expected):
-    assert resolve_settings(settings)["align_start_times"] is expected
+@pytest.mark.parametrize("settings,expected", [({}, True), ({"packager_timing_compatibility": False}, False)])
+def test_packager_compatibility_defaults_on_and_preserves_explicit_config(settings, expected):
+    assert resolve_settings(settings)["packager_timing_compatibility"] is expected
 
 
 @pytest.mark.parametrize("local", [True, False])
@@ -70,12 +70,18 @@ def test_omitted_negative_cli_flags_preserve_mode_defaults(monkeypatch, local):
     settings = Common.merge_dicts([settings, CliArgumentsParser.parse()])
     resolved = resolve_settings(settings)
     assert resolved["overwrite_manifest"] is local
-    assert resolved["align_start_times"] is True
+    assert resolved["packager_timing_compatibility"] is True
 
 
-def test_alignment_requires_json_boolean():
-    with pytest.raises(ValueError, match='align_start_times must be a boolean'):
-        resolve_settings({"align_start_times": "false"})
+def test_packager_compatibility_requires_json_boolean():
+    with pytest.raises(ValueError, match='packager_timing_compatibility must be a boolean'):
+        resolve_settings({"packager_timing_compatibility": "false"})
+
+
+def test_removed_alignment_cli_flag_is_not_an_alias():
+    with pytest.raises(SystemExit) as error:
+        CliArgumentsParser.build_argument_parser().parse_args(['-no_align_start_times'])
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize(

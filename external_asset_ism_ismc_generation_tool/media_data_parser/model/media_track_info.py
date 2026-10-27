@@ -62,10 +62,17 @@ class MediaTrackInfo(BaseModel):
         self.language = language
         self.track_name = track_name
         self.start_time = start_time
+        self.end_time = None
+        self.decode_start_time = None
+        self.fragment_index = None
+        self.fragment_timescale = None
 
     def is_equal_chunk_data(self, other) -> bool:
         if not other:
             return False
+        if self.fragment_index is not None or other.fragment_index is not None:
+            return (self.fragment_index == other.fragment_index
+                    and self.fragment_timescale == other.fragment_timescale)
         return self.chunk_datas == other.chunk_datas and self.start_time == other.start_time
 
     def is_equal_language(self, other) -> bool:

@@ -55,7 +55,7 @@ def test_audio_timeline_groups_have_consistent_distinct_manifest_names(align, bi
         'English', 'English', 'English1', 'English1', 'English2',
     ]
 
-    client = ET.fromstring(IsmcGenerator.generate(5, media.media_track_info_list, align_start_times=align))
+    client = ET.fromstring(IsmcGenerator.generate(5, media.media_track_info_list, packager_timing_compatibility=align))
     streams = client.findall('StreamIndex')
     assert [stream.get('Name') for stream in streams] == ['English', 'English1', 'English2']
     assert [stream.get('QualityLevels') for stream in streams] == ['2', '2', '1']

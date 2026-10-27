@@ -1,8 +1,8 @@
 # Tests for ISM/ISMC manifests generation tool
 
-harmonic_external_asset_ism_ismc_generation_tool is a command line tool to generate the ISM/ISMC manifest for the .mp4 files stored in Azure containers.
-The tool parses .mp4 files from an Azure container, generates .ism and .ismc manifests if they do not exist, and loads them into the Azure container.
-tests is a module for testing external_asset_ism_ismc_generation tool.
+These tests cover local and Azure media reading, timing extraction, configuration,
+subtitle conversion, and ISM/ISMC generation. Integration fixtures exercise the
+generated manifests without requiring a live Azure account.
 
 
 ## Prerequisites
@@ -41,7 +41,7 @@ pytest tests/integration_tests/test_ism_generation.py::TestIsmGeneration::test_c
 ## Timing and configuration regressions
 
 ```bash
-python3 -m pytest tests/test_local_media_data_parser.py tests/test_media_data_parser.py tests/test_settings_and_manifest_names.py tests/test_main.py -q
+python3 -m pytest tests/test_local_media_data_parser.py tests/test_azure_media_data_parser.py tests/test_edit_list_parser.py tests/test_media_data_parser.py tests/test_settings_and_manifest_names.py tests/test_main.py -q
 ```
 
 Synthetic binary boxes and track metadata cover version 0/1 edit lists, signed
@@ -51,6 +51,23 @@ the large source MP4. Coverage also includes chunk-repeat grouping, whole-chunk
 alignment trims, non-overlapping tracks, unchanged subtitles, non-mutating mode
 switching, MPI start-time replacement, invalid edit metadata, worker error
 propagation, JSON boolean validation, and the value-free negative CLI flags.
+
+Fragmented MP4 binary cases additionally cover `tfdt` versions 0/1, signed `trun`
+offsets, composition-delay edit compensation, contiguous sample reordering, matching
+per-track defaults, multiple runs, missing decode timestamps, discontinuity rejection,
+and cross-file inferred duration with and without worker processes.
+
+Indexed fMP4 cases cover `tfra` versions 0/1 and reference widths 1-4, standard and
+extended child headers, retained local/Azure file offsets, first-run/sample reference
+validation, malformed and incomplete indexes, missing track fragments and indexes,
+interleaved tracks, native timescales, timestamps beyond float precision, rendition
+grouping, and unchanged index addresses under both alignment settings. Edited
+presentation metadata remains independently tested. HLS marker cases verify native
+timescale conversion, the positive one-tick marker for zero starts, and unchanged
+chunk addressing with the marker enabled or disabled.
+
+Edit-list tests exercise the production `TRAKParser` and `MediaTrackInfoExtractor`,
+including rejection of unsupported edits rather than silently ignoring them.
 
 Existing JSON fixtures exercise full media parsing and manifest generation for
 multiple codecs, renditions, index files, and subtitle formats. These tests do not

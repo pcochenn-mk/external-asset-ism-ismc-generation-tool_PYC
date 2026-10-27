@@ -8,9 +8,10 @@ class MediaData(BaseModel):
     _media_duration: int = 0
     _media_track_info_list: List[MediaTrackInfo] = []
     
-    def __init__(self, media_duration: int, media_track_info_list: List[MediaTrackInfo]):
+    def __init__(self, media_duration: int, media_track_info_list: List[MediaTrackInfo], duration_bounds=None):
         self._media_duration = media_duration
         self._media_track_info_list = media_track_info_list
+        self.duration_bounds = duration_bounds
 
     @property
     def media_duration(self) -> int:

@@ -1,5 +1,7 @@
 import math
 from fractions import Fraction
+from types import SimpleNamespace
+from external_asset_ism_ismc_generation_tool.media_data_parser.atom_parser.fragment_index_parser import FragmentIndexParser
 from typing import Any, Tuple, Dict, List, Union
 from concurrent.futures import ProcessPoolExecutor
 from os import cpu_count
@@ -43,8 +45,9 @@ class MediaDataParser:
         return media_data
 
     @staticmethod
-    def parse_media_data(blob_name: str, media_data: Dict[str, Union[bytes, List[bytes]]]) -> Tuple[int, List[MediaTrackInfo]]:
+    def parse_media_data(blob_name: str, media_data: Dict[str, Union[bytes, List[bytes]]]) -> MediaData:
         moof_fragments = {}
+        moof_timings = {}
         media_track_info_list = []
         media_duration = 0
 
@@ -56,14 +59,29 @@ class MediaDataParser:
         moov_atom = MediaBoxExtractor.get_mp4_box(parsed_moov_box, 'moov')
         if moov_atom:
             mvhd_atom = MediaBoxExtractor.get_mp4_sub_box(moov_atom, 'mvhd')
-            media_duration = mvhd_atom['duration'] / mvhd_atom['timescale']
+            media_duration = (Fraction(mvhd_atom['duration'], mvhd_atom['timescale'])
+                              if mvhd_atom['timescale'] > 0 else 0)
             trak_atoms = MediaBoxExtractor.get_all_mp4_sub_boxes(moov_atom, 'trak')
             mvex_atom = MediaBoxExtractor.get_mp4_sub_box(moov_atom, 'mvex')
             mehd_atom = MediaBoxExtractor.get_mp4_sub_box(mvex_atom, 'mehd')
-            if mehd_atom:
+            if mehd_atom and mvhd_atom['timescale'] > 0:
                 MediaDataParser.__logger.info(f'Moof boxes are detected in {blob_name}')
-                media_duration = mehd_atom["fragment_duration"] / mvhd_atom['timescale']
-            trex_atom = MediaBoxExtractor.get_mp4_sub_box(mvex_atom, 'trex')
+                media_duration = Fraction(mehd_atom["fragment_duration"], mvhd_atom['timescale'])
+            trex_atoms = {atom.track_ID: atom for atom in
+                          MediaBoxExtractor.get_all_mp4_sub_boxes(mvex_atom, 'trex')}
+            extractors = [MediaTrackInfoExtractor(trak, mvhd_atom['duration'], mvhd_atom['timescale'],
+                                                 blob_name, mvex_atom) for trak in trak_atoms]
+            timescales = {extractor.track_id: extractor.timescale for extractor in extractors}
+            fragment_indexes = (FragmentIndexParser.parse(media_data['mfra'])
+                                if blob_name.lower().endswith('.mp4') and 'mfra' in media_data else None)
+            if fragment_indexes is not None:
+                if set(fragment_indexes) - set(timescales):
+                    raise ValueError(f'Unknown tfra track in {blob_name}')
+                if len(media_data.get('moof_offsets', [])) != len(media_data.get(MediaDataParser._MOOFS, [])):
+                    raise ValueError(f'Missing fragment file offsets for {blob_name}')
+            MediaDataParser.__fill_moof_fragments_from_boxes(
+                media_data.get(MediaDataParser._MOOFS), moof_fragments, trex_atoms, timescales,
+                moof_timings if blob_name.lower().endswith('.mp4') else None, media_data.get('moof_offsets'))
 
             # First pass: determine IDR-aligned segment duration for audio/subtitle alignment
             _SEGMENT_DURATION = 2  # seconds - same as in stts_parser
@@ -126,14 +144,25 @@ class MediaDataParser:
 
             for trak_atom in trak_atoms:
                 media_track_info_creator = MediaTrackInfoExtractor(trak_atom, mvhd_atom['duration'], mvhd_atom['timescale'], blob_name, mvex_atom, video_segment_duration_ticks, video_timescale, idr_filtered_key_frames)
-                timescale = media_track_info_creator.timescale
-                MediaDataParser.__fill_moof_fragments_from_boxes(media_data.get(MediaDataParser._MOOFS), moof_fragments, trex_atom, timescale)
-                track_info = media_track_info_creator.get_track_info(moof_fragments)
+                track_info = media_track_info_creator.get_track_info(moof_fragments, moof_timings)
+                if fragment_indexes is not None and track_info.track_type in (TrackType.AUDIO, TrackType.VIDEO):
+                    MediaDataParser.__set_fragment_index(
+                        track_info, fragment_indexes, moof_fragments, moof_timings, timescales[track_info.track_id])
                 media_track_info_list.append(track_info)
         else:
             MediaDataParser.__logger.error(f'Cannot get tracks info: There is no `moov` atom in mp4 data for {blob_name}: {moov_atom}')
             raise ValueError("There is no 'moov' atom in mp4 data")
-        return MediaData(media_duration, media_track_info_list)
+        duration_bounds = None
+        timed_tracks = [track for track in media_track_info_list if track.end_time is not None]
+        if media_duration <= 0 and timed_tracks:
+            origin = min(Fraction(track.fragment_index[0][0], track.fragment_timescale)
+                         if track.fragment_index is not None else min(track.decode_start_time, track.start_time)
+                         for track in timed_tracks)
+            endpoint = max(Fraction(sum(track.fragment_index[-1]), track.fragment_timescale)
+                           if track.fragment_index is not None else track.end_time for track in timed_tracks)
+            duration_bounds = origin, endpoint
+            media_duration = endpoint - origin
+        return MediaData(media_duration, media_track_info_list, duration_bounds)
 
     @staticmethod
     def __process_media_tasks_and_update_media_data(media_datas: Dict[str, dict], executor: ProcessPoolExecutor, media_data: MediaData):
@@ -145,6 +174,13 @@ class MediaDataParser:
                 task_media_data : MediaData = task.result() if executor else task_mapping[task]
                 if task_media_data.media_duration > media_data.media_duration:
                     media_data.media_duration = task_media_data.media_duration
+                if task_media_data.duration_bounds is not None:
+                    origin, endpoint = task_media_data.duration_bounds
+                    if media_data.duration_bounds is not None:
+                        origin = min(origin, media_data.duration_bounds[0])
+                        endpoint = max(endpoint, media_data.duration_bounds[1])
+                    media_data.duration_bounds = origin, endpoint
+                    media_data.media_duration = max(media_data.media_duration, endpoint - origin)
                 if not MediaFormat.is_mpi_format(blob_name):
                     media_data.media_track_info_list += task_media_data.media_track_info_list
                 else:
@@ -186,24 +222,26 @@ class MediaDataParser:
     @staticmethod
     def __get_moof_fragment_sample_total(trun_atom: Any, tfhd_atom: Any, trex_atom: Any,
                                          field_name: str) -> int:
+        return sum(MediaDataParser.__get_moof_sample_value(sample, tfhd_atom, trex_atom, field_name)
+                   for sample in trun_atom.sample_info)
+
+    @staticmethod
+    def __get_moof_sample_value(sample: Any, tfhd_atom: Any, trex_atom: Any, field_name: str) -> int:
         track_id = tfhd_atom.track_ID
-        total = 0
-        for sample in trun_atom.sample_info:
-            value = getattr(sample, field_name)
-            if value is None:
-                default_field_name = f'default_{field_name}'
-                tfhd_default = getattr(tfhd_atom, default_field_name, None)
-                trex_default = getattr(trex_atom, default_field_name, None) if trex_atom else None
-                if tfhd_default is not None:
-                    value = tfhd_default
-                elif trex_atom is not None and trex_atom.track_ID == track_id and trex_default not in (None, 0):
-                    value = trex_default
-            if value is None:
-                raise ValueError(
-                    f"Cannot calculate moof fragment {field_name}: sample value and defaults are missing for track {track_id}"
-                )
-            total += value
-        return total
+        value = getattr(sample, field_name)
+        if value is None:
+            default_field_name = f'default_{field_name}'
+            tfhd_default = getattr(tfhd_atom, default_field_name, None)
+            trex_default = getattr(trex_atom, default_field_name, None) if trex_atom else None
+            if tfhd_default is not None:
+                value = tfhd_default
+            elif trex_atom is not None and trex_atom.track_ID == track_id and trex_default not in (None, 0):
+                value = trex_default
+        if value is None:
+            raise ValueError(
+                f"Cannot calculate moof fragment {field_name}: sample value and defaults are missing for track {track_id}"
+            )
+        return value
 
     @staticmethod
     def __get_moof_fragment_duration(trun_atom: Any, tfhd_atom: Any, trex_atom: Any) -> int:
@@ -218,13 +256,34 @@ class MediaDataParser:
         )
 
     @staticmethod
-    def __fill_moof_fragment(moof_fragments: Dict[int, List], tfhd_atom: Box, trun_atom: Box, trex_atom: Box, timescale: int) -> None:
+    def __fill_moof_fragment(moof_fragments: Dict[int, List], tfhd_atom: Box, trun_atom: Box,
+                             trex_atom: Box, timescale: int, moof_timings: dict = None,
+                             decode_time: int = 0) -> None:
         track_id = tfhd_atom.track_ID
         fragment = moof_fragments.setdefault(track_id, [[], []])
         duration = MediaDataParser.__get_moof_fragment_duration(trun_atom, tfhd_atom, trex_atom)
         fragment[0].append(Fraction(duration, timescale))
         size = MediaDataParser.__get_moof_fragment_size(trun_atom, tfhd_atom, trex_atom)
         fragment[1].append(size)
+        if moof_timings is not None:
+            intervals = []
+            for sample in trun_atom.sample_info:
+                sample_duration = MediaDataParser.__get_moof_sample_value(
+                    sample, tfhd_atom, trex_atom, 'sample_duration')
+                offset = getattr(sample, 'sample_composition_time_offsets', None) or 0
+                intervals.append((decode_time + offset, decode_time + offset + sample_duration))
+                decode_time += sample_duration
+            if not intervals:
+                raise ValueError(f'Empty fragment for track {track_id}')
+            ordered = sorted(intervals)
+            for sample_start, sample_end in ordered:
+                if sample_end <= sample_start:
+                    raise ValueError(f'Nonpositive sample duration for track {track_id}')
+            if any(previous[1] != current[0] for previous, current in zip(ordered, ordered[1:])):
+                raise ValueError(f'Unsupported composition gap or overlap inside fragment for track {track_id}')
+            moof_timings.setdefault(track_id, []).append((
+                Fraction(min(start for start, end in intervals), timescale),
+                Fraction(max(end for start, end in intervals), timescale)))
 
     @staticmethod
     def __should_change_track_info(track: MediaTrackInfo, track_index: MediaTrackInfo) -> bool:
@@ -238,14 +297,22 @@ class MediaDataParser:
         track.chunks = track_index.chunks
         track.chunk_datas = track_index.chunk_datas
         track.start_time = track_index.start_time
+        track.end_time = track_index.end_time
+        track.decode_start_time = track_index.decode_start_time
+        track.fragment_index = track_index.fragment_index
+        track.fragment_timescale = track_index.fragment_timescale
         track.bit_rate = track_index.bit_rate
         MediaDataParser.__logger.info(f'Changed chunks, bitrate, added index_blob_name {track.index_blob_name} for {track.blob_name} with track_id {track.track_id}')
 
     @staticmethod
-    def __fill_moof_fragments_from_boxes(moof_boxes: List[bytes], moof_fragments: Dict[int, List], trex_atom: Box, timescale: int) -> None:
+    def __fill_moof_fragments_from_boxes(moof_boxes: List[bytes], moof_fragments: Dict[int, List],
+                                       trex_atoms: dict, timescales: dict, moof_timings: dict,
+                                       moof_offsets: List[int] = None) -> None:
         if not moof_boxes:
             return
-        for moof_box in moof_boxes:
+        decode_ends = {}
+        decode_starts = {}
+        for moof_number, moof_box in enumerate(moof_boxes):
             parsed_moof_box = MediaBoxExtractor.extract_media_boxes(moof_box)
             if not parsed_moof_box:
                 MediaDataParser.__logger.error(f'Cannot parse moof box: {moof_box}')
@@ -255,10 +322,59 @@ class MediaDataParser:
                 MediaDataParser.__logger.error(f'Cannot get moof box from {parsed_moof_box}')
                 raise ValueError("There is no 'moof' atom in mp4 data")
             traf_atoms = MediaBoxExtractor.get_all_mp4_sub_boxes(moof_atom, 'traf')
-            for traf_atom in traf_atoms:
+            for traf_number, traf_atom in enumerate(traf_atoms, 1):
                 tfhd_atom = MediaBoxExtractor.get_mp4_sub_box(traf_atom, 'tfhd')
-                trun_atom = MediaBoxExtractor.get_mp4_sub_box(traf_atom, 'trun')
-                MediaDataParser.__fill_moof_fragment(moof_fragments, tfhd_atom, trun_atom, trex_atom, timescale)
+                if tfhd_atom is None or tfhd_atom.track_ID not in timescales:
+                    raise ValueError('Fragment has a missing or unknown track header')
+                track_id = tfhd_atom.track_ID
+                timescale = timescales[track_id]
+                if timescale <= 0:
+                    raise ValueError(f'Fragment requires a positive timescale for track {track_id}')
+                tfdt_atom = MediaBoxExtractor.get_mp4_sub_box(traf_atom, 'tfdt')
+                decode_time = tfdt_atom.baseMediaDecodeTime if tfdt_atom is not None else decode_ends.get(track_id, 0)
+                if moof_timings is not None and track_id in decode_ends and decode_time != decode_ends[track_id]:
+                    raise ValueError(f'Unsupported fragment decode gap or overlap for track {track_id}')
+                decode_starts.setdefault(track_id, Fraction(decode_time, timescale))
+                runs = MediaBoxExtractor.get_all_mp4_sub_boxes(traf_atom, 'trun')
+                trun_atom = SimpleNamespace(sample_info=[sample for run in runs for sample in run.sample_info])
+                trex_atom = trex_atoms.get(track_id)
+                MediaDataParser.__fill_moof_fragment(
+                    moof_fragments, tfhd_atom, trun_atom, trex_atom, timescale, moof_timings, decode_time)
+                decode_ends[track_id] = decode_time + MediaDataParser.__get_moof_fragment_duration(
+                    trun_atom, tfhd_atom, trex_atom)
+                if moof_timings is not None:
+                    if moof_offsets is not None:
+                        moof_timings.setdefault('fragment_locations', {}).setdefault(track_id, []).append(
+                            (moof_offsets[moof_number], traf_number))
+                    intervals = moof_timings[track_id]
+                    if len(intervals) > 1 and intervals[-2][1] != intervals[-1][0]:
+                        raise ValueError(f'Unsupported fragment presentation gap or overlap for track {track_id}')
+        if moof_timings is not None:
+            moof_timings['decode_starts'] = decode_starts
+
+    @staticmethod
+    def __set_fragment_index(track: MediaTrackInfo, indexes: dict, fragments: dict,
+                             timings: dict, timescale: int) -> None:
+        """Validate complete source addressing independently of edited presentation timing."""
+        entries = indexes.get(track.track_id, [])
+        durations = fragments.get(track.track_id, [[], []])[0]
+        locations = timings.get('fragment_locations', {}).get(track.track_id, [])
+        if not entries or len(entries) != len(durations) or len(entries) != len(locations):
+            raise ValueError(f'Incomplete tfra index for {track.blob_name}, track {track.track_id}')
+        chunks = []
+        for position, (entry, duration, location) in enumerate(zip(entries, durations, locations)):
+            time, offset, traf_number, run_number, sample_number = entry
+            if (offset, traf_number) != location or run_number != 1 or sample_number != 1:
+                raise ValueError(f'Unsupported tfra fragment reference for {track.blob_name}, track {track.track_id}')
+            if position and (time <= entries[position - 1][0] or offset <= entries[position - 1][1]):
+                raise ValueError(f'Non-increasing tfra index for {track.blob_name}, track {track.track_id}')
+            sample_ticks = duration * timescale
+            ticks = entries[position + 1][0] - time if position + 1 < len(entries) else sample_ticks
+            if ticks <= 0 or ticks != sample_ticks or sample_ticks.denominator != 1:
+                raise ValueError(f'tfra duration does not match fragment samples for {track.blob_name}, track {track.track_id}')
+            chunks.append((time, int(ticks)))
+        track.fragment_index = chunks
+        track.fragment_timescale = timescale
 
     @staticmethod
     def __update_media_track_info_list(media_data: MediaData) -> None:

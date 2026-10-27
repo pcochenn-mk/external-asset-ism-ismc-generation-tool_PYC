@@ -105,34 +105,45 @@ Controls whether canonical manifest names are replaced. When omitted, it default
 local mode and `false` in Azure mode. The value-free `-no_overwrite_manifest` CLI flag overrides
 this value to `false`; omitting the flag leaves the configuration value unchanged.
 
-### align_start_times (boolean, default: true)
-MP4 edit lists (`edts/elst`, versions 0 and 1) are applied before generating the ISMC.
+### packager_timing_compatibility (boolean, default: true)
+Enables downstream-packager timing compatibility. For non-indexed MP4 it aligns
+presentation starts; for indexed fMP4 it enables the HLS timing marker without
+changing fragment addresses or durations. Edit-list parsing is independent of
+this setting, and disabling it does not disable edit-list handling.
+
+For non-indexed tracks, MP4 edit lists (`edts/elst`, versions 0 and 1) are applied before generating the ISMC.
 Leading empty edits delay the presentation start; media-time edits trim the beginning
 of the media, and finite edit durations limit its end. Video composition offsets
 (`ctts`) are accounted for so that a composition-delay edit is not trimmed twice.
 Movie edit durations use the `mvhd` timescale, while media times use the track's
 `mdhd` timescale. ISMC timestamps use the manifest timescale (10,000,000 ticks/second).
 
-- **true**: align all audio/video streams to the latest A/V presentation start and
+- **true**: align non-indexed audio/video streams to their latest presentation start and
   emit `StreamStartTimestamp` on each A/V `StreamIndex`. Earlier media is trimmed,
   not shifted: subsequent segment boundaries and stream end times are preserved.
   This is the downstream-packager compatibility mode. Subtitle timing is unchanged.
 - **false**: preserve individual edit-derived presentation starts in the first
   `<c t="...">` and omit `StreamStartTimestamp`.
 
+Indexed fragmented `.mp4` tracks always retain their source `tfra` addresses,
+regardless of this setting. They are not trimmed or aligned. With the default
+`true` setting they receive a positive `StreamStartTimestamp` marker for the
+packager's HLS timing mode; `false` omits this marker without changing fragment
+addresses. Non-fragmented tracks and subtitles retain existing behavior.
+
 Set this in `azure_config.json` for either local or Azure processing:
 ```json
 {
-  "align_start_times": true
+  "packager_timing_compatibility": true
 }
 ```
-The value-free CLI flag `-no_align_start_times` overrides this setting to `false`.
+The value-free CLI flag `-no_packager_timing_compatibility` overrides this setting to `false`.
 When omitted, the configuration value is used, defaulting to `true`. To enable
-alignment explicitly, set `"align_start_times": true` in the configuration file;
+packager compatibility explicitly, set `"packager_timing_compatibility": true` in the configuration file;
 there is no positive CLI flag. Neither negative flag accepts `true` or `false` as a value.
 For example:
 ```bash
-python3 main.py -local_directory=/path/to/assets -no_align_start_times
+python3 main.py -local_directory=/path/to/assets -no_packager_timing_compatibility
 ```
 
 For `room02.mp4`, the video empty edit is 1.92 seconds and the audio media-time
@@ -153,12 +164,71 @@ duration extends through all remaining media. Alignment fails explicitly if
 an A/V track ends at or before the common start. Missing, malformed, or duplicate edit
 lists inside an edit box, nonpositive edit timescales, and edits that select no media
 also abort generation. An absent edit box or a valid empty edit list has no timing effect.
-Invalid `align_start_times` configuration values are reported as configuration errors;
+Invalid `packager_timing_compatibility` configuration values are reported as configuration errors;
 use JSON booleans, not strings such as `"false"`.
 
-The composition-delay mapping uses the initial `ctts` offset; it does not re-segment
+For non-fragmented MP4, composition-delay mapping uses the initial `ctts` offset; it does not re-segment
 individual sample presentation timestamps or rewrite the MP4. End-to-end DASH/HLS
 playback still needs validation with the downstream packager.
+
+### Fragmented MP4 Timing
+
+For fragmented `.mp4` input, fragment presentation times come from `tfdt`, sample
+durations, and signed or unsigned `trun` composition offsets. Missing `tfdt` continues
+the preceding decode timeline for that track, starting at zero for its first fragment.
+Sample duration and size defaults are resolved from `trun`, `tfhd`, then the matching
+track's `trex`. Multiple runs in a track fragment are combined once.
+
+Edit lists select composition-time intervals and map them into the presentation
+timeline. This preserves initial composition delays without trimming them twice.
+Absolute timestamps and relative offsets between files are retained, not reset
+independently. These edited presentation values remain available in parsed metadata.
+
+For indexed fragmented MP4, AMS/external POTF uses `mfra/tfra` times to locate the
+source fragments; edited presentation starts are not interchangeable with these keys.
+The generator therefore serializes validated `tfra` entry times, with durations between
+consecutive entries and the final duration taken from the last fragment's samples.
+Each indexed `StreamIndex` uses its native track `TimeScale` so large timestamps and
+fractional rates retain exact keys. The root manifest timescale remains 10,000,000.
+No edit trimming or common-start alignment is applied to indexed tracks. Both local
+and Azure range readers retain the same index data without downloading `mdat` bodies.
+
+With `packager_timing_compatibility=true`, indexed A/V streams carry `StreamStartTimestamp`
+using the latest indexed A/V edited presentation start, converted to each stream's
+native timescale. This is metadata only: chunk starts, durations, and repeat counts
+are unchanged. AMS/external POTF treats a positive value as the switch enabling its
+HLS absolute-media-time mode. When the common start rounds to zero, the generator
+uses a one-tick marker because that packager treats zero as absent; this does not
+move the media or segment addresses. `-no_packager_timing_compatibility` omits the marker.
+
+The indexed-fMP4 workflow has been confirmed with downstream DASH and HLS
+packaging on the tested input. This is packager-specific interoperability testing,
+not a guarantee for every MP4 edit sequence; the supported limits below still apply.
+
+Supported indexes have one entry per track fragment, referencing its first run and
+first sample. Index offsets and track-fragment references must match the scanned
+fragments, with strictly increasing times and offsets. Indexed durations must match
+the corresponding sample durations. Missing track fragments or indexes, duplicate
+or malformed indexes, partial coverage, and unsupported references fail explicitly.
+
+Without an `mfra` index, the existing generic presentation-timing path remains in use:
+`packager_timing_compatibility` controls alignment, and `-no_packager_timing_compatibility` preserves individual
+edited starts in the 10,000,000-tick timescale. This fallback is not a replacement for
+the index required by an external POTF packager consuming indexed fMP4.
+
+When movie and fragment headers supply no positive duration, duration is inferred
+from the earliest decode or edited presentation origin to the latest edited endpoint,
+including relative offsets between such files without treating absolute clock values
+as the duration. For indexed tracks the bounds instead use the first index key and
+last indexed fragment endpoint, so presentation edits cannot inflate the addressing
+span. Fragment times remain rational until manifest tick conversion.
+
+This limited implementation requires contiguous decode and presentation intervals.
+Composition reordering is supported within a fragment when its samples still cover
+one contiguous interval. Decode gaps/overlaps, presentation gaps/overlaps, empty or
+nonpositive-duration fragments, and negative edited presentation starts fail explicitly.
+Existing Smooth `.isma`/`.ismv`, MPI, CMFT, and non-fragmented timing paths are retained.
+No media timestamps are rewritten, and no VTT wall-clock synchronization is performed.
 
 ### Manifest Generation Behavior
 When manifests are generated:

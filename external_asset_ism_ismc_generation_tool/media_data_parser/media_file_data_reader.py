@@ -144,6 +144,7 @@ class MediaFileDataReader:
     ) -> None:
         start_byte = offset
         media_data.setdefault(MediaFileDataReader._MOOFS, [])
+        moof_offsets = []
 
         while start_byte < file_size:
             atom_start = start_byte
@@ -190,8 +191,15 @@ class MediaFileDataReader:
                 media_data[MediaFileDataReader._MOOFS].append(
                     MediaFileDataReader.build_standard_box(atom_type, body)
                 )
+                moof_offsets.append(atom_start)
                 start_byte = atom_start + atom_size
             elif atom_type == AtomType.MFRA_ATOM_TYPE.value:
+                body_length = atom_size - header_length
+                body = read_range(start_byte, body_length) if body_length else b''
+                if len(body) != body_length:
+                    raise ValueError(f"Truncated atom 'mfra' at offset {atom_start}")
+                media_data['mfra'] = MediaFileDataReader.build_standard_box(atom_type, body)
+                media_data['moof_offsets'] = moof_offsets
                 break
             else:
                 start_byte = atom_start + atom_size

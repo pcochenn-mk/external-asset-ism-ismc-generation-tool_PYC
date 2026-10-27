@@ -80,7 +80,7 @@ class TestConvertVttToCmft:
 class TestGenerateManifestsLocal:
     """Test local manifest generation"""
     
-    @pytest.mark.parametrize('align_start_times', [True, False])
+    @pytest.mark.parametrize('packager_timing_compatibility', [True, False])
     @patch('main.IsmcGenerator')
     @patch('main.IsmGenerator')
     @patch('main.MediaDataParser')
@@ -93,11 +93,11 @@ class TestGenerateManifestsLocal:
         mock_media_parser,
         mock_ism_gen,
         mock_ismc_gen,
-        align_start_times
+        packager_timing_compatibility
     ):
         """Test manifest generation in local mode"""
         # Setup
-        settings = {'local_directory': '/test/path', 'align_start_times': align_start_times}
+        settings = {'local_directory': '/test/path', 'packager_timing_compatibility': packager_timing_compatibility}
         
         # Mock LocalFileServiceClient
         mock_client_instance = Mock()
@@ -135,13 +135,13 @@ class TestGenerateManifestsLocal:
         assert result.ism_created is True
         assert result.ismc_created is True
         assert mock_client_instance.write_file.call_count == 2
-        assert mock_ismc_gen.generate.call_args.kwargs['align_start_times'] is align_start_times
+        assert mock_ismc_gen.generate.call_args.kwargs['packager_timing_compatibility'] is packager_timing_compatibility
 
 
 class TestGenerateManifestsAzure:
     """Test Azure manifest generation"""
     
-    @pytest.mark.parametrize('align_start_times', [True, False])
+    @pytest.mark.parametrize('packager_timing_compatibility', [True, False])
     @patch('main.IsmcGenerator')
     @patch('main.IsmGenerator')
     @patch('main.MediaDataParser')
@@ -154,11 +154,11 @@ class TestGenerateManifestsAzure:
         mock_media_parser,
         mock_ism_gen,
         mock_ismc_gen,
-        align_start_times
+        packager_timing_compatibility
     ):
         """Test manifest generation in Azure mode"""
         # Setup
-        settings = {'azure_connection': 'test', 'align_start_times': align_start_times}
+        settings = {'azure_connection': 'test', 'packager_timing_compatibility': packager_timing_compatibility}
         
         # Mock AzureBlobServiceClient
         mock_client_instance = Mock()
@@ -196,7 +196,7 @@ class TestGenerateManifestsAzure:
         assert result.ism_created is True
         assert result.ismc_created is True
         assert mock_client_instance.upload_blob_to_container.call_count == 2
-        assert mock_ismc_gen.generate.call_args.kwargs['align_start_times'] is align_start_times
+        assert mock_ismc_gen.generate.call_args.kwargs['packager_timing_compatibility'] is packager_timing_compatibility
     
     @patch('main.IsmcGenerator')
     @patch('main.IsmGenerator')
@@ -370,11 +370,11 @@ class TestCliErrorHandling:
 
     @pytest.mark.parametrize('value', ['false', 0, [], {}])
     def test_invalid_alignment_config_reports_clean_error(self, tmp_path, value):
-        (tmp_path / 'azure_config.json').write_text(json.dumps({'align_start_times': value}))
+        (tmp_path / 'azure_config.json').write_text(json.dumps({'packager_timing_compatibility': value}))
         main_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'main.py')
         result = subprocess.run([sys.executable, main_path], cwd=tmp_path, capture_output=True, text=True)
         assert result.returncode == 1
-        assert 'Configuration failed: align_start_times must be a boolean' in result.stdout
+        assert 'Configuration failed: packager_timing_compatibility must be a boolean' in result.stdout
         assert 'Traceback' not in result.stdout + result.stderr
 
     def test_no_media_or_manifest_source_reports_clean_error(self, tmp_path):

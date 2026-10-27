@@ -2,10 +2,9 @@
 Unit tests for AzureMediaDataParser, focused on ISO/IEC 14496-12 box header
 parsing (in particular the 64-bit extended box size / 'largesize' field).
 
-Mirrors tests/test_local_media_data_parser.py: the same box-scanning fix was
-applied to both LocalMediaDataParser and AzureMediaDataParser, so both must be
-covered. A minimal fake blob client is used in place of AzureBlobServiceClient
-since the real client requires an actual Azure connection.
+Mirrors tests/test_local_media_data_parser.py: both adapters delegate scanning
+and fragment-index retention to MediaFileDataReader. A minimal fake blob client
+checks the Azure range-reading path without requiring an Azure connection.
 """
 import struct
 
@@ -43,6 +42,24 @@ class FakeAzureBlobServiceClient:
 
 class TestExtendedBoxSize:
     """Verifies that boxes using the 64-bit extended size are parsed correctly."""
+
+    @pytest.mark.parametrize('extended', [False, True])
+    def test_fragment_index_retains_physical_offsets_after_header_normalization(self, extended):
+        build_box = _extended_box if extended else _box
+        ftyp = _box(b'ftyp', b'isom')
+        moov = build_box(b'moov', b'mvex' + bytes(8))
+        fragment = build_box(b'moof', b'fragment-data')
+        mdat = _extended_box(b'mdat', bytes(64))
+        index_body = _box(b'mfro', bytes(8))
+        mfra = build_box(b'mfra', index_body)
+        client = FakeAzureBlobServiceClient(ftyp + moov + fragment + mdat + fragment + mfra)
+
+        data = AzureMediaDataParser.get_media_data(client, 'indexed.mp4')
+
+        first_offset = len(ftyp) + len(moov)
+        assert data['moof_offsets'] == [first_offset, first_offset + len(fragment) + len(mdat)]
+        assert data['moofs'] == [_box(b'moof', b'fragment-data')] * 2
+        assert data['mfra'] == _box(b'mfra', index_body)
 
     def test_get_media_data_finds_moov_after_extended_size_mdat(self):
         # A non-fragmented blob where 'mdat' precedes 'moov' and uses the

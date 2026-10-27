@@ -41,19 +41,13 @@ class MediaTrackInfoExtractor:
         mdia_atom = MediaBoxExtractor.get_mp4_sub_box(trak_atom, 'mdia')
         minf_atom = MediaBoxExtractor.get_mp4_sub_box(mdia_atom, 'minf')
         stbl_atom = MediaBoxExtractor.get_mp4_sub_box(minf_atom, 'stbl')
-        trex_atom = MediaBoxExtractor.get_mp4_sub_box(mvex_atom, 'trex')
         self.stss_parser = STSSParser(MediaBoxExtractor.get_mp4_sub_box(stbl_atom, 'stss'))
         self.stts_parser = STTSParser(MediaBoxExtractor.get_mp4_sub_box(stbl_atom, 'stts'))
         self.stsz_parser = STSZParser(MediaBoxExtractor.get_mp4_sub_box(stbl_atom, 'stsz'))
         self.stsd_parser = STSDParser(MediaBoxExtractor.get_mp4_sub_box(stbl_atom, 'stsd'))
         self.audio_parser = self.__get_audio_parser(stbl_atom)
         self.track_type = self.trak_parser.get_track_type()
-        # moof box case
-        if trex_atom:
-            self.track_id = trex_atom.track_ID
-        # regular case
-        else:
-            self.track_id = self.trak_parser.get_track_id()
+        self.track_id = self.trak_parser.get_track_id()
         if self.track_type is not TrackType.TEXT:
             self.track_size = self.stsz_parser.get_track_size()
         self.timescale = self.trak_parser.get_timescale()
@@ -68,7 +62,7 @@ class MediaTrackInfoExtractor:
         self.blob_name = blob_name
         self.mvex_atom = mvex_atom
 
-    def get_track_info(self, moof_fragments: dict) -> MediaTrackInfo:
+    def get_track_info(self, moof_fragments: dict, moof_timings: dict = None) -> MediaTrackInfo:
         MediaTrackInfoExtractor.__logger.info(f'Get {self.track_type.value} track info from {self.blob_name}')
         if self.track_type == TrackType.VIDEO:
             track_info = self.__extract_video_track_info(moof_fragments)
@@ -77,7 +71,30 @@ class MediaTrackInfoExtractor:
         elif self.track_type == TrackType.TEXT:
             track_info = self.__extract_text_track_info(moof_fragments)
         edit_timing = self.trak_parser.get_edit_timing(self.movie_timescale)
-        if edit_timing is not None:
+        if (moof_timings and track_info.track_id in moof_timings
+                and self.track_type in (TrackType.AUDIO, TrackType.VIDEO)):
+            intervals = moof_timings[track_info.track_id]
+            if edit_timing is not None:
+                empty_duration, media_time, edit_duration = edit_timing
+                selected = []
+                for start, end in intervals:
+                    start = max(start, media_time)
+                    if edit_duration > 0:
+                        end = min(end, media_time + edit_duration)
+                    if end > start:
+                        selected.append((empty_duration + start - media_time,
+                                         empty_duration + end - media_time))
+                intervals = selected
+            if not intervals:
+                raise ValueError(f'Edit list selects no media for {self.blob_name}, track {track_info.track_id}')
+            if intervals[0][0] < 0:
+                raise ValueError(f'Negative fragment presentation start for {self.blob_name}, track {track_info.track_id}')
+            track_info.start_time = intervals[0][0]
+            track_info.end_time = intervals[-1][1]
+            track_info.decode_start_time = moof_timings.get('decode_starts', {}).get(track_info.track_id, Fraction(0))
+            track_info.chunk_datas = [end - start for start, end in intervals]
+            track_info.chunks = len(intervals)
+        elif edit_timing is not None:
             empty_duration, media_time, edit_duration = edit_timing
             composition_start = Fraction(0)
             # The initial composition delay may already be compensated by media_time.
@@ -102,7 +119,8 @@ class MediaTrackInfoExtractor:
                 raise ValueError(f'Edit list selects no media for {self.blob_name}, track {track_info.track_id}')
             track_info.chunk_datas = chunks
             track_info.chunks = len(chunks)
-        track_info.chunk_datas = [float(chunk) for chunk in track_info.chunk_datas]
+        if track_info.end_time is None:
+            track_info.chunk_datas = [float(chunk) for chunk in track_info.chunk_datas]
         return track_info
 
     def __extract_text_track_info(self, moof_fragments: dict) -> MediaTrackInfo:
@@ -232,6 +250,8 @@ class MediaTrackInfoExtractor:
 
     def __extract_chunks_and_bitrate_from_moof(self, moof_fragments: dict) -> Tuple[list, int]:
         track_id_info = moof_fragments.get(self.track_id)
+        if not track_id_info:
+            raise ValueError(f'No fragments for {self.blob_name}, track {self.track_id}')
         chunks, chunk_sizes = track_id_info
         
         # Calculate bitrate

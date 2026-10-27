@@ -25,8 +25,8 @@ class CliArgumentsParser:
             help="Preserve existing manifests and generate a suffixed pair."
         )
         argument_parser.add_argument(
-            "-no_align_start_times", dest="align_start_times", action="store_false", default=None,
-            help="Preserve the individual MP4 edit-list presentation starts."
+            "-no_packager_timing_compatibility", dest="packager_timing_compatibility", action="store_false", default=None,
+            help="Preserve individual edit-list presentation starts for non-indexed tracks and omit StreamStartTimestamp. Indexed fMP4 always retains source fragment addresses."
         )
         return argument_parser
 
